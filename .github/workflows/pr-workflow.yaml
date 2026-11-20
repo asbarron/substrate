@@ -108,9 +108,14 @@ jobs:
         key: cargo-${{ runner.os }}-${{ hashFiles('cmd/dataplane/envoy/dynamic-modules/Cargo.lock') }}
         restore-keys: cargo-${{ runner.os }}-
     - name: dynamic module tests
+      # The runner image already ships clang and libclang. Installing them from
+      # apt on every run occasionally stalls for over ten minutes on the mirror,
+      # so only fall back to apt on an image that lacks them.
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq --no-install-recommends clang libclang-dev
+        if ! compgen -G '/usr/lib/llvm-*/lib/libclang-*.so.*' >/dev/null || ! command -v clang >/dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang libclang-dev
+        fi
         hack/test-dynamic-modules.sh
     # Root-gated tests (overlay mounts, whiteout mknod, trusted.* xattrs, ...)
     # skip for the unprivileged runner user above; rerun the packages that
@@ -187,8 +192,7 @@ jobs:
   # envoy entry with preview features off reports the required e2e-test check.
   e2e-test:
     name: >-
-      ${{ (matrix.dataplane == 'envoy' && matrix.preview == 'off') && 'e2e-test'
-        || format('e2e-test ({0}{1})', matrix.dataplane, matrix.preview == 'on' && ', preview' || '') }}
+      ${{ format('e2e-test ({0}, {1}{2})', matrix.sandbox, matrix.dataplane, matrix.preview == 'on' && ', preview' || '') }}
     runs-on: ubuntu-latest
     # Cluster bring-up, image builds and two sequential lanes; generous, but far
     # short of the six-hour platform default a hung lane would otherwise consume.
@@ -212,6 +216,9 @@ jobs:
         # "off" is the default install, and proves the suites pass without
         # preview features; "on" enables every one of them.
         preview: ['off', 'on']
+        # Each sandbox class gets its own job and cluster, so the two lanes run
+        # in parallel instead of back to back on one node.
+        sandbox: ['gvisor', 'microvm']
     env:
       E2E_ATENET_DATAPLANE: ${{ matrix.dataplane }}
       # Apply the e2e test component (short atelet snapshot delays) during the
@@ -233,6 +240,8 @@ jobs:
       # Appended to the lane and artifact names: e2e-gvisor runs without
       # preview features, e2e-gvisor-preview with them.
       LANE_SUFFIX: ${{ matrix.preview == 'on' && '-preview' || '' }}
+      # Empty selects the gVisor fixtures (internal/e2e/sandbox.go).
+      E2E_SANDBOX_CLASS: ${{ matrix.sandbox == 'microvm' && 'microvm' || '' }}
       # E2E_JUNIT_FILE is set per step, not here: the lanes below share this
       # job, so one job-level path would have each overwrite the last.
       ARTIFACTS: ${{ github.workspace }}/_artifacts
@@ -240,7 +249,7 @@ jobs:
       # share one copy instead of each storing their own.
       DOCKER_BUILD_FLAGS: >-
         --cache-from type=gha,scope=envoy-dataplane
-        ${{ github.ref == 'refs/heads/main' && matrix.dataplane == 'envoy' && matrix.preview == 'off'
+        ${{ github.ref == 'refs/heads/main' && matrix.dataplane == 'envoy' && matrix.preview == 'off' && matrix.sandbox == 'gvisor'
           && '--cache-to type=gha,mode=max,scope=envoy-dataplane,ignore-error=true' || '' }}
     steps:
     - name: Checkout
@@ -314,37 +323,20 @@ jobs:
         sudo modprobe nfsd || true
     - name: Install CSI NFS driver
       run: go run ./cmd/ate-setup --kind setup csi nfs
-    - name: Deploy micro-VM counter demo
-      run: go run ./cmd/ate-setup --kind deploy demo counter-microvm
-    - name: Deploy gVisor counter demo
-      run: go run ./cmd/ate-setup --kind deploy demo counter
-    - name: Deploy egress demos
+    - name: Deploy counter demo (${{ matrix.sandbox }})
+      run: go run ./cmd/ate-setup --kind deploy demo ${{ matrix.sandbox == 'microvm' && 'counter-microvm' || 'counter' }}
+    - name: Deploy egress demo (${{ matrix.sandbox }})
       # TestActorEgress in the networking suite builds its Actor from the egress
-      # ActorTemplate for the class under test, so both fixtures have to exist
-      # before their respective lane runs. The demo's actors trust the CA the
-      # gateway mints its leaves from.
-      run: |
-        go run ./cmd/ate-setup --kind deploy demo egress
-        go run ./cmd/ate-setup --kind deploy demo egress-microvm
+      # ActorTemplate for the class under test. The demo's actors trust the CA
+      # the gateway mints its leaves from.
+      run: go run ./cmd/ate-setup --kind deploy demo ${{ matrix.sandbox == 'microvm' && 'egress-microvm' || 'egress' }}
     - name: Trust local TLS origins in egress gateway
       run: hack/setup-e2e-egress-tls-kind.sh
-    # scale the idle sandbox class's demo pools to zero so each lane has the node
-    - name: Focus the node on gVisor
-      run: hack/e2e-focus-sandbox-class.sh gvisor
-    - name: Run E2E tests (gVisor)
+    # Only this lane's sandbox class is deployed, so the node is already focused.
+    - name: Run E2E tests (${{ matrix.sandbox }})
       env:
         E2E_PARALLELISM: 8
-        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-gvisor${{ env.LANE_SUFFIX }}.xml
-      run: hack/run-e2e-kind.sh -args --no-color --preview="${ATE_PREVIEW}"
-    - name: Focus the node on micro-VM
-      run: hack/e2e-focus-sandbox-class.sh microvm
-    - name: Run E2E tests (micro-VM)
-      # The same suites again, with every fixture repointed at its micro-VM
-      # variant by the single E2E_SANDBOX_CLASS knob (see internal/e2e/sandbox.go).
-      env:
-        E2E_SANDBOX_CLASS: microvm
-        E2E_PARALLELISM: 8
-        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-microvm${{ env.LANE_SUFFIX }}.xml
+        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-${{ matrix.sandbox }}${{ env.LANE_SUFFIX }}.xml
       run: hack/run-e2e-kind.sh -args --no-color --preview="${ATE_PREVIEW}"
     # Every lane must have reported tests; a `-run` filter that stops matching
     # otherwise leaves its lane green and empty. The set comes from the manifest
@@ -359,7 +351,7 @@ jobs:
     - name: Save Go build cache
       # Main only, so PRs restore the latest main build rather than each
       # storing its own copy.
-      if: ${{ !cancelled() && github.ref == 'refs/heads/main' && matrix.dataplane == 'envoy' && matrix.preview == 'off' }}
+      if: ${{ !cancelled() && github.ref == 'refs/heads/main' && matrix.dataplane == 'envoy' && matrix.preview == 'off' && matrix.sandbox == 'gvisor' }}
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
@@ -370,7 +362,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: test-results-e2e-${{ matrix.dataplane }}${{ env.LANE_SUFFIX }}
+        name: test-results-e2e-${{ matrix.sandbox }}-${{ matrix.dataplane }}${{ env.LANE_SUFFIX }}
         path: ${{ env.ARTIFACTS }}
         if-no-files-found: error
     - name: Dump diagnostics on failure
@@ -391,6 +383,21 @@ jobs:
         kubectl --context kind-kind get pods -A -l ate.dev/worker-pool \
           -o 'custom-columns=:.metadata.namespace,:.metadata.name' --no-headers 2>/dev/null \
           | while read -r ns name; do dump "$ns" "$name"; done
+  # Keeps the single required "e2e-test" check name: green only when every
+  # e2e lane in the matrix passed (lanes marked continue-on-error count as passed).
+  e2e-test-required:
+    name: e2e-test
+    if: always()
+    needs: e2e-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Require the e2e lanes to have passed
+      env:
+        RESULT: ${{ needs.e2e-test.result }}
+      run: |
+        echo "e2e lanes: ${RESULT}"
+        [[ "${RESULT}" == "success" ]]
   # The per-commit Go caches above are saved on every push to main. Keep only
   # the newest of each so they stay inside the repository's cache quota.
   # This job exists only on pushes to main, so the write-scoped token is never
