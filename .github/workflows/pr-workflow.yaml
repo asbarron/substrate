@@ -96,9 +96,14 @@ jobs:
         key: cargo-${{ runner.os }}-${{ hashFiles('cmd/dataplane/envoy/dynamic-modules/Cargo.lock') }}
         restore-keys: cargo-${{ runner.os }}-
     - name: dynamic module tests
+      # The runner image already ships clang and libclang. Installing them from
+      # apt on every run occasionally stalls for over ten minutes on the mirror,
+      # so only fall back to apt on an image that lacks them.
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq --no-install-recommends clang libclang-dev
+        if ! compgen -G '/usr/lib/llvm-*/lib/libclang-*.so.*' >/dev/null || ! command -v clang >/dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang libclang-dev
+        fi
         hack/test-dynamic-modules.sh
     # Root-gated tests (overlay mounts, whiteout mknod, trusted.* xattrs, ...)
     # skip for the unprivileged runner user above; rerun the packages that
@@ -123,8 +128,23 @@ jobs:
         name: test-results-unit
         path: ${{ env.ARTIFACTS }}
         if-no-files-found: error
+    # golangci-lint keeps its analysis results outside the Go build cache.
+    # Restore them from the latest main run; only main saves, so PRs share one
+    # small copy (~80 MB).
+    - name: Restore golangci-lint cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cache/golangci-lint
+        key: golangci-lint-${{ runner.os }}-${{ github.sha }}
+        restore-keys: golangci-lint-${{ runner.os }}-
     - name: verify
       run: hack/verify-all.sh
+    - name: Save golangci-lint cache
+      if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cache/golangci-lint
+        key: golangci-lint-${{ runner.os }}-${{ github.sha }}
   verify-migrations:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
@@ -339,8 +359,8 @@ jobs:
         kubectl --context kind-kind get pods -A -l ate.dev/worker-pool \
           -o 'custom-columns=:.metadata.namespace,:.metadata.name' --no-headers 2>/dev/null \
           | while read -r ns name; do dump "$ns" "$name"; done
-  # Keeps the single required "e2e-test" check: green only when every required
-  # lane (envoy, preview off, both sandbox classes) passed.
+  # Keeps the single required "e2e-test" check name: green only when every
+  # e2e lane in the matrix passed (lanes marked continue-on-error count as passed).
   e2e-test-required:
     name: e2e-test
     if: always()
